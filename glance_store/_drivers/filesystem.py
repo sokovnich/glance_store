@@ -22,6 +22,7 @@ import errno
 import hashlib
 import logging
 import os
+import shutil
 import stat
 
 import jsonschema
@@ -762,6 +763,86 @@ class Store(glance_store.driver.Store):
 
         return ('file://%s' % filepath,
                 bytes_written,
+                checksum_hex,
+                hash_hex,
+                metadata)
+
+    @glance_store.driver.back_compat_add
+    @capabilities.check
+    def add_by_path(self, image_id, image_path, hashing_algo, context=None,
+            verifier=None, move=False):
+        """
+        Stores an image file with supplied identifier to the backend
+        storage system and returns a tuple containing information
+        about the stored image.
+
+        :param image_id: The opaque image identifier
+        :param image_path: The source image file path
+        :param image_size: The size of the image data to write, in bytes
+        :param hashing_algo: A hashlib algorithm identifier (string)
+        :param context: The request context
+        :param verifier: An object used to verify signatures for images
+        :param move: Move source image file instead of copy.
+        Suitable for dealing with images stored to a temporary directory
+        on the same drive as backend storage system
+        because it uses os.rename call under the hood in this case.
+
+        :returns: tuple of: (1) URL in backing store, (2) bytes written,
+                  (3) checksum, (4) multihash value, and (5) a dictionary
+                  with storage system specific information
+        """
+        image_size = os.path.getsize(image_path)
+
+        if verifier:
+            raise NotImplementedError(
+                'Signature verifier is not supported yet'
+            )
+
+        datadir = self._find_best_datadir(image_size)
+        filepath = os.path.join(datadir, str(image_id))
+
+        if os.path.exists(filepath):
+            raise exceptions.Duplicate(image=filepath)
+
+        if move:
+            shutil.move(image_path, filepath)
+        else:
+            shutil.copy(image_path, filepath)
+
+        os_hash_value = hashlib.new(str(hashing_algo))
+        checksum = hashlib.md5()
+
+        hash_hex = os_hash_value.hexdigest()
+        checksum_hex = checksum.hexdigest()
+        metadata = self._get_metadata(filepath)
+
+        LOG.debug(("Wrote %(bytes_written)d bytes to %(filepath)s with "
+                   "checksum %(checksum_hex)s and multihash %(hash_hex)s"),
+                  {'bytes_written': image_size,
+                   'filepath': filepath,
+                   'checksum_hex': checksum_hex,
+                   'hash_hex': hash_hex})
+
+        if self.backend_group:
+            fstore_perm = getattr(
+                self.conf, self.backend_group).filesystem_store_file_perm
+        else:
+            fstore_perm = self.conf.glance_store.filesystem_store_file_perm
+
+        if fstore_perm > 0:
+            perm = int(str(fstore_perm), 8)
+            try:
+                os.chmod(filepath, perm)
+            except (IOError, OSError):
+                LOG.warning(_LW("Unable to set permission to image: %s") %
+                            filepath)
+
+        # Add store backend information to location metadata
+        if self.backend_group:
+            metadata['backend'] = u"%s" % self.backend_group
+
+        return ('file://%s' % filepath,
+                image_size,
                 checksum_hex,
                 hash_hex,
                 metadata)
