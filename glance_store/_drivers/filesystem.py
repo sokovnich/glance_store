@@ -20,11 +20,13 @@ A simple filesystem-backed store
 
 import errno
 import hashlib
+import json
 import logging
 import os
 import stat
 
 import jsonschema
+from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
@@ -261,6 +263,11 @@ class Store(glance_store.driver.Store):
                      capabilities.BitMasks.DRIVER_REUSABLE)
     OPTIONS = _FILESYSTEM_CONFIGS
     FILESYSTEM_STORE_METADATA = None
+
+    def __init__(self, *args, **kwargs):
+        super(Store, self).__init__(*args, **kwargs)
+
+        self.supported_formats = ['qcow2', 'raw', 'iso']
 
     def get_schemes(self):
         return ('file', 'filesystem')
@@ -731,6 +738,8 @@ class Store(glance_store.driver.Store):
             with excutils.save_and_reraise_exception():
                 self._delete_partial(filepath, image_id)
 
+        self._introspect(image_path=filepath)
+
         hash_hex = os_hash_value.hexdigest()
         checksum_hex = checksum.hexdigest()
         metadata = self._get_metadata(filepath)
@@ -765,6 +774,36 @@ class Store(glance_store.driver.Store):
                 checksum_hex,
                 hash_hex,
                 metadata)
+
+    def _introspect(self, image_path):
+        try:
+            stdout, stderr = processutils.trycmd(
+                "qemu-img", "info",
+                "--output=json",
+                image_path,
+                prlimit=processutils.ProcessLimits(
+                    cpu_time=2, address_space=1 * units.Gi
+                ),
+                log_errors=processutils.LOG_ALL_ERRORS,
+            )
+        except OSError as exc:
+            with excutils.save_and_reraise_exception():
+                exc_message = encodeutils.exception_to_unicode(exc)
+                msg = ("Failed to do introspection of image "
+                       "%(path)s: %(err)s")
+                LOG.error(msg, {'path': image_path, 'err': exc_message})
+
+        if stderr:
+            raise RuntimeError(stderr)
+
+        metadata = json.loads(stdout)
+
+        source_format = metadata.get('format')
+        if source_format not in self.supported_formats:
+            raise RuntimeError(
+                'Image %s has format %s which is not supported'
+                % (image_path, source_format)
+            )
 
     @staticmethod
     def _delete_partial(filepath, iid):
